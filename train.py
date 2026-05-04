@@ -99,12 +99,14 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+        # SwiGLU requires splitting the hidden dimension, so we project to 4x and split to 2x for the gate
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_proj = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square()
+        x_gate, x_up = x.chunk(2, dim=-1)
+        x = F.silu(x_gate) * x_up  # SwiGLU activation
         x = self.c_proj(x)
         return x
 
@@ -131,6 +133,7 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.weight = self.transformer.wte.weight  # TIE WEIGHTS to free ~17M parameters
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
@@ -239,7 +242,8 @@ class GPT(nn.Module):
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        # Avoid double-updating if weights are tied
+        lm_head_params = [] if self.lm_head.weight is self.transformer.wte.weight else list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
@@ -447,7 +451,7 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 8               # number of transformer layers
+DEPTH = 11              # increased from 8 because weight tying freed up capacity
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
@@ -521,8 +525,10 @@ def get_lr_multiplier(progress):
     elif progress < 1.0 - WARMDOWN_RATIO:
         return 1.0
     else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+        # Cosine decay schedule for smooth, optimal convergence
+        decay_ratio = (progress - (1.0 - WARMDOWN_RATIO)) / WARMDOWN_RATIO
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return FINAL_LR_FRAC + coeff * (1.0 - FINAL_LR_FRAC)
 
 def get_muon_momentum(step):
     frac = min(step / 300, 1)
@@ -543,9 +549,18 @@ step = 0
 while True:
     torch.cuda.synchronize()
     t0 = time.time()
+    
+    # Progressive sequence length: start with short sequences, end with full context
+    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    current_seq_len = 512 if progress < 0.6 else (1024 if progress < 0.85 else MAX_SEQ_LEN)
+    
     for micro_step in range(grad_accum_steps):
+        # Slice batch to dramatically speed up early steps
+        x_sub = x[:, :current_seq_len]
+        y_sub = y[:, :current_seq_len]
+        
         with autocast_ctx:
-            loss = model(x, y)
+            loss = model(x_sub, y_sub)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
